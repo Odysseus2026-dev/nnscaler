@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import OrderedDict, defaultdict
 
@@ -50,6 +51,7 @@ from nnscaler.ir.unique import IDGenerator
 
 from nnscaler.runtime.adapter.reducer import Bucket, Reducer, ParamZeroConfig
 from nnscaler.runtime.device import DeviceGroup
+from nnscaler.runtime.checkpoint_broadcast import broadcast_checkpoint_tensors
 from nnscaler.runtime.gnorm import calcuate_gnorm, clip_grads
 from nnscaler.runtime.module import (
     AttrMeta,
@@ -60,6 +62,8 @@ from nnscaler.runtime.module import (
     ExtraState,
     dedup_attrs,
     NonParallelModule,
+    merged_load_session,
+    load_merged_module,
 )
 
 from nnscaler.flags import CompileFlag, RuntimeFlag
@@ -689,6 +693,7 @@ def _prepare_and_check_reusable(
         compute_config: ComputeConfig,
         instance_name: Optional[str] = None,
         reuse: ReuseType = ReuseType.MATCH,
+        allow_missing_init_weights: bool = False,
     ) -> Tuple[str, bool]:
     """
     Prepare the output directory for code generation, and also check if the existing code is reusable.
@@ -751,6 +756,11 @@ def _prepare_and_check_reusable(
         expected_output_files.append(outdir / _FORWARD_ARGS_DUMP_FILE)
         expected_output_files.append(outdir / ParallelModule.ORIGIN_MODULE_METADATA_FILE)
         expected_output_files.append(outdir / FxModuleParser.NON_PERSISTENT_BUFFER_FILE)
+        # A resume-only staged package can omit initial weights, which would
+        # be overwritten by the checkpoint. All code, configuration, mapping,
+        # graph metadata, and non-persistent buffers are still mandatory.
+        if allow_missing_init_weights and not (outdir / FxModuleParser.ATTR_CONTENT_FILE_0).exists():
+            expected_output_files.remove(outdir / FxModuleParser.ATTR_CONTENT_FILE_0)
         compact_expected_output_files = expected_output_files + [outdir / ParallelModule.ATTR_META_FILE]
         legacy_expected_output_files = expected_output_files + [
             outdir / ParallelModule.ATTR_META_FILE_TEMPLATE.format(rank)
@@ -1373,6 +1383,7 @@ def parallelize(
     module_dtype:  Optional[torch.dtype] = None,
     module_fn: Optional[Callable[[], torch.nn.Module]] = None,
     init_module_params: bool = True,
+    allow_missing_init_weights: bool = False,
     build_module_buckets: bool = True,
     broadcast_strategy: Union[str, BroadcastGenFilesStrategy] = 'none',
     autoset_requires_grad: bool = True,
@@ -1456,6 +1467,11 @@ def parallelize(
             so it is only used when module_or_module_class is a module object, and load_module is true.
             Please leave it to true until you have a good reason to change it.
         module_dtype (Optional[torch.dtype]): the dtype of the module. Keep the module as it is if it is None.
+        allow_missing_init_weights (bool): accept a resume-only generated package without
+            initial fullmodel.pt.<n> shards. Code, compute configuration, attribute metadata
+            and non-persistent buffers are still checked. The caller must construct the
+            generated class with init_params=False and restore its weights before use.
+            This does not skip initialization or relax checkpoint validation by itself.
         module_fn (Optional[Callable[[], torch.nn.Module]]): the function to create the module. Will use __init__ if it is None.
         broadcast_strategy (Union[str, BroadcastGenFilesStrategy]): the broadcast strategy for generated files.
             Please note that the broadcasting will only be done in torchrun environment,
@@ -1516,7 +1532,9 @@ def parallelize(
         # generate code only in node0
         # if it is not in a torchrun environment, just generate.
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            outdir, reusable = _prepare_and_check_reusable(gen_savedir, module_class, compute_config, instance_name, reuse)
+            outdir, reusable = _prepare_and_check_reusable(
+                gen_savedir, module_class, compute_config, instance_name, reuse,
+                allow_missing_init_weights=allow_missing_init_weights)
             if not reusable:
                 config_file = outdir / ParallelModule.COMPUTE_CONFIG_FILE
                 ComputeConfig.safe_dump_to_file(compute_config, config_file)  # always refresh compute config
@@ -2641,7 +2659,56 @@ def merge_state_dicts(
     return ret_state_dict, ret_opt_state_dict
 
 
+_merged_load_lock = threading.RLock()
+
+
+def _checkpoint_load_num_threads():
+    """Bound the restore pool by CPU affinity and visible cgroup-v2 quotas."""
+    cpus = (len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity')
+            else os.cpu_count() or 1)
+    root = Path('/sys/fs/cgroup')
+    directories = {root}
+    try:
+        for entry in Path('/proc/self/cgroup').read_text().splitlines():
+            if entry.startswith('0::'):
+                group = root / entry[3:].lstrip('/')
+                directories.update(p for p in (group, *group.parents)
+                                   if p.is_relative_to(root))
+    except OSError:
+        pass
+    # The mount root covers cgroup namespaces; ancestors can impose a tighter
+    # quota than the process's own group. Missing quotas leave affinity intact.
+    for directory in directories:
+        try:
+            quota, period = (directory / 'cpu.max').read_text().split()
+        except OSError:
+            continue
+        if quota != 'max':
+            cpus = min(cpus, max(1, int(quota) // int(period)))
+    local_ranks = max(1, int(os.environ.get('LOCAL_WORLD_SIZE', '1')))
+    return max(1, min(8, cpus // local_ranks))
+
+
+@contextmanager
+def _merged_load_cpu_threads():
+    # torchrun usually sets one CPU thread. Restoration benefits from a small
+    # pool, shared across this node's ranks; training keeps its original pool.
+    # Serialize restores within a process because set_num_threads is global.
+    with _merged_load_lock:
+        requested = _checkpoint_load_num_threads()
+        previous = torch.get_num_threads()
+        changed = requested != previous
+        if changed:
+            torch.set_num_threads(requested)
+        try:
+            yield
+        finally:
+            if changed:
+                torch.set_num_threads(previous)
+
+
 @torch.no_grad()
+@_merged_load_cpu_threads()
 def load_merged_state_dict(
     module: torch.nn.Module,
     module_state_dict: Dict[str, Any],
@@ -2671,12 +2738,17 @@ def load_merged_state_dict(
     # non ParallelModule parameters will be loaded here
     # there will be mismatched keys if the module is a ParallelModule or contains ParallelModule
     # so we need to ignore the mismatched keys
-    module.load_state_dict(module_state_dict, strict=False)
-    # load ParallelModule state dicts
-    for name, child_module in module.named_modules():
-        if isinstance(child_module, ParallelModule):
-            prefix = name + '.' if name else ''
-            child_module.load_merged_state_dict(module_state_dict, prefix=prefix)
+    parallel_modules = [
+        (name + '.' if name else '', child)
+        for name, child in module.named_modules() if isinstance(child, ParallelModule)
+    ]
+    # Keep the explicit pass for custom/legacy handlers that do not load merged
+    # parameters recursively. Completed loads are recorded only for this call;
+    # the explicit pass still checks missing keys without copying values twice.
+    with merged_load_session(module):
+        module.load_state_dict(module_state_dict, strict=False)
+        for prefix, child_module in parallel_modules:
+            load_merged_module(child_module, module_state_dict, prefix=prefix)
 
     if optimizer is not None and optimizer_state_dict is not None:
         new_optimizer_state_dict = _trim_optimizer_merged_state_dict(module, optimizer._extra_state, optimizer_state_dict, device='cpu')
@@ -2881,6 +2953,45 @@ def _construct_optim_state_zero3(
     return state_dict
 
 
+def _copy_optim_state_slice(destination: torch.Tensor, source: torch.Tensor,
+                           offset: int, val_chunks: int):
+    """Divide a logical flat slice into owned storage without flattening a copy."""
+    count = destination.numel()
+    if count == 0:
+        return
+    if offset == 0 and count == source.numel():
+        destination = destination.view(source.shape)
+    elif source.is_contiguous():
+        source = source.view(-1)[offset:offset + count]
+    else:
+        # Split a strided range into at most two partial edge rows and one
+        # complete middle block. All source slices remain views; recursion is
+        # needed only at the edges, not once for every row of a large tensor.
+        row_size = source.numel() // source.shape[0]
+        row, start = divmod(offset, row_size)
+        copied = 0
+        if start:
+            copied = min(row_size - start, count)
+            _copy_optim_state_slice(destination[:copied], source[row], start, val_chunks)
+            row += 1
+        rows, tail = divmod(count - copied, row_size)
+        if rows:
+            end = copied + rows * row_size
+            _copy_optim_state_slice(destination[copied:end], source[row:row + rows], 0, val_chunks)
+            copied = end
+        if tail:
+            _copy_optim_state_slice(destination[copied:], source[row + rows], 0, val_chunks)
+        return
+
+    # Keep the original division, including /1. A device/dtype conversion must
+    # happen after source arithmetic to preserve its rounding.
+    if (source.device == destination.device
+            and torch.result_type(source, 1.0) == destination.dtype):
+        torch.div(source, val_chunks, out=destination)
+    else:
+        destination.copy_(source / val_chunks)
+
+
 def _construct_optim_state_zero(
         module: ParallelModule,
         orig_param_dict: Dict[str, Dict[str, Any]],
@@ -2893,110 +3004,55 @@ def _construct_optim_state_zero(
             key: original parameter name
             value: the state dict for each attribute, e.g. 'step', 'exp_avg', 'exp_avg_sq' are keys
     """
-    dist_param_map = module.dist_param_map  # name in parallel module (without tid suffix) -> name in origin module
-    param_area_map = module.fullmap         # str -> AttrMeta
-    def _get_optimizer_state_of_param(param, param_ids, local_names):
-        # find the parameter's optimizer state and pick the slices induced by tensor parallelism
-        param_idx = param_ids.index(id(param))
-        local_name = local_names[param_idx]
-        return _extract_new_state(local_name, orig_param_dict, dist_param_map, param_area_map)
-
-    # prepare param ids and corresponding local param names
-    param_ids, local_names = [], []
-    for local_name, param in module.named_parameters():
-        param_ids.append(id(param))
-        local_names.append(local_name)
+    # Resolve identity once instead of scanning all parameters for each bucket.
+    local_names = {id(param): name for name, param in module.named_parameters()}
     state_dict, opt_param_idx = {}, 0
     opt_param = module.parameters_for_optimizer()
-    # first load the params' optimizer state for the reducers's flattened params
     for reducer in module.reducers:
         rank_idx, sub_ranks = module._get_zero_subranks(reducer)
         for bucket in reducer.buckets:
-            # one bucket corresponds to one flattened param
             assert len(opt_param[opt_param_idx].shape) == 1
             assert bucket._contiguous_params.shape[0] % len(sub_ranks) == 0
             chunk_size = bucket._contiguous_params.shape[0] // len(sub_ranks)
-            # the flattened param is in the range [bucket_chunk_start, bucket_chunk_end)
-            bucket_chunk_start = rank_idx * chunk_size
-            bucket_chunk_end = (rank_idx + 1) * chunk_size
-            # NOTE: assume the traverse order of params is consistent
-            # with them in contiguous buffer.
-            # param_offset: the param's start offset in the contiguous buffer
-            # chunk_offset: the offset of the current rank corresponding chunk
-            step, opt_states, opt_state_keys = None, {}, None
+            chunk_start = rank_idx * chunk_size
+            chunk_end = chunk_start + chunk_size
+            opt_states, state_keys, step = {}, None, None
             for param in bucket.params:
-                param_offset = reducer.get_param_info(param).bucket_param_buffer_start
-                sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-                # there are padding in the chunk, so `param.numel()` doesn't work here
-                param_numel = bucket.get_aligned_numel(param)
-                # init the chunk's optimizer state
-                if opt_state_keys is None:
-                    opt_state_keys = [key for key in sliced_new_val]
-                    if 'step' in sliced_new_val:
-                        step = sliced_new_val['step']
-                    if 'step' in sliced_new_val:
-                        opt_state_keys.remove('step')
-                    for key in opt_state_keys:
-                        opt_states[key] = torch.zeros([chunk_size], dtype=sliced_new_val[key].dtype,
-                                                        device='cpu', requires_grad=False)
-                # copy the param's slices to the optimizer's chunk
-                for key in opt_state_keys:
-                    sliced_new_val[key] = sliced_new_val[key].view(-1)
+                local_name = local_names[id(param)]
+                meta = module.fullmap[local_name]
+                original_name = module.dist_param_map[local_name.rsplit('_', 1)[0]]
+                source_state = orig_param_dict[original_name]
+                if state_keys is None:
+                    state_keys = [key for key in source_state if key != 'step']
+                    step = source_state.get('step')
+                    for key in state_keys:
+                        # Match true division's dtype, including integer states.
+                        dtype = torch.result_type(source_state[key], 1.0)
+                        opt_states[key] = torch.zeros(chunk_size, dtype=dtype, device='cpu')
 
-                # parameter range: <>
-                # bucket range: []
-                # in the following branches, we check the range including paddings.
-                # but in branch body, we only copy the valid range (without paddings) but update the chunk_offset with paddings.
-                if param_offset < bucket_chunk_start \
-                    and bucket_chunk_start < param_offset + param_numel < bucket_chunk_end:
-                    # case: < [ > ]
-                    copy_size = param_offset + param_numel - bucket_chunk_start
-                    copy_size_without_padding = param_offset + param.numel() - bucket_chunk_start
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][-copy_size_without_padding:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and bucket_chunk_start <= param_offset + param_numel < bucket_chunk_end:
-                    # case: [ <  > ]
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+param.numel()] = sliced_new_val[key][:]
-                elif bucket_chunk_start <= param_offset < bucket_chunk_end \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: [ < ] >
-                    copy_size = bucket_chunk_end - param_offset
-                    copy_size_without_padding = min(copy_size, param.numel())
-                    chunk_offset = param_offset - bucket_chunk_start
-                    for key in opt_state_keys:
-                        opt_states[key][chunk_offset:chunk_offset+copy_size_without_padding] = sliced_new_val[key][:copy_size_without_padding]
-                elif param_offset < bucket_chunk_start \
-                    and param_offset + param_numel >= bucket_chunk_end:
-                    # case: < [ ] >
-                    copy_size = bucket_chunk_end - bucket_chunk_start
-                    copy_size_without_padding = min(copy_size, param_offset + param.numel() - bucket_chunk_start)
-                    chunk_offset = 0
-                    if copy_size_without_padding > 0:
-                        for key in opt_state_keys:
-                            opt_states[key][chunk_offset:chunk_offset + copy_size_without_padding] \
-                                = sliced_new_val[key][bucket_chunk_start-param_offset:bucket_chunk_start-param_offset + copy_size_without_padding]
-                else:
-                    # case: [] <>, <> []
-                    logger.debug(f'Skipped: parameter range({param_offset},{param_offset + param_numel}) vs. bucket range({bucket_chunk_start},{bucket_chunk_end})')
+                param_start = reducer.get_param_info(param).bucket_param_buffer_start
+                # Intersect only real parameter data. Padding stays zero, even
+                # when this rank's chunk starts or ends entirely inside padding.
+                start = max(param_start, chunk_start)
+                end = min(param_start + param.numel(), chunk_end)
+                if start >= end:
+                    continue
+                for key in state_keys:
+                    source = source_state[key][meta.slicers]
+                    destination = opt_states[key][start - chunk_start:end - chunk_start]
+                    _copy_optim_state_slice(destination, source, start - param_start, meta.val_chunks)
 
+            # Preserve the original field order as well as its values.
             if step is not None:
                 opt_states['step'] = step
             state_dict[opt_param_idx] = opt_states
             opt_param_idx += 1
-    # load the params' optimizer state that are not in reducers
-    # this part corresponds to nnscaler/runtime/module.py: parameters_for_optimizer
-    reducer_pids = set()
-    for reducer in module.reducers:
-        reducer_pids.update(id(p) for p in reducer.params)
+
+    reducer_pids = {id(param) for reducer in module.reducers for param in reducer.params}
     for param in module.parameters():
         if id(param) not in reducer_pids:
-            sliced_new_val = _get_optimizer_state_of_param(param, param_ids, local_names)
-            state_dict[opt_param_idx] = sliced_new_val
+            state_dict[opt_param_idx] = _extract_new_state(
+                local_names[id(param)], orig_param_dict, module.dist_param_map, module.fullmap)
             opt_param_idx += 1
     return state_dict
 
@@ -3332,15 +3388,21 @@ def load_deduped_state_dict(
 
         torch.distributed.barrier()
 
-        # broadcast weights in parallel modules inside dedup group (most time it is the 1st scale unit)
-        # Implementation of `deduped_state_dict` can guarantee that the first rank in each rank group always has the weights
+        # Restore one membership at a time in a deterministic global order.
+        # Only members synchronize between batches; nonmembers no longer enter
+        # a world barrier for every individual parameter. The world barrier at
+        # the end of this phase still precedes cross-scale-unit propagation.
+        group_keys = defaultdict(list)
         for key_name, ranks in local_name2ranks.items():
             if len(ranks) <= 1:
                 continue
-            prefix, local_name = key_name
-            if cur_rank in ranks:
+            group_keys[tuple(ranks)].append(key_name)
+        for ranks, keys in sorted(group_keys.items()):
+            if cur_rank not in ranks:
+                continue
+            broadcast_group = DeviceGroup().get_group(ranks)
+            for prefix, local_name in keys:
                 key = f'{prefix}.{local_name}' if prefix else local_name
-                broadcast_group = DeviceGroup().get_group(ranks)
                 assert prefix in no_zero3_pms, f'Prefix {prefix} not found in parallel_modules: {list(no_zero3_pms.keys())}.'
                 pm = no_zero3_pms[prefix]
                 assert hasattr(pm, local_name), f'Local name {local_name} not found in {pm}.'
@@ -3372,7 +3434,7 @@ def load_deduped_state_dict(
                                 f'At rank {cur_rank}, the attribute {key} is already loaded, ' \
                                 f'but not equal to the broadcasted tensor from rank {ranks[0]}.'
 
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=broadcast_group)
 
         for key in missing_keys:
             split_names = key.split('.')
@@ -3446,57 +3508,39 @@ def _broadcast_opt_state(optimizer_state_dict: OptStateDict, state_indexes: List
             src=src_rank,
             group=curr_parallel_group,
     )
-    state_indexes = list(sent[0])
-    if rank != src_rank:
-        for k, v in sent[0].items():
-            optimizer_state_dict['state'][k] = {
-                key: torch.zeros(value[0], dtype=value[1], device=torch.cuda.current_device())
-                for key, value in v.items()
-            }
-    else:
-        for idx in state_indexes:
-           for key, value in optimizer_state_dict['state'][idx].items():
-               optimizer_state_dict['state'][idx][key] = optimizer_state_dict['state'][idx][key].cuda()
-
-    # broadcast step
-    # step is too small, so we can just broadcast all of them all together
-    # some adam/adamw optimizers may not have step in their state dict
-    # so we need to check if 'step' is in the state dict
-    step_state_indexes = [k for k in state_indexes if 'step' in optimizer_state_dict['state'][k]]
-    if step_state_indexes:
-        assert all(
-            optimizer_state_dict['state'][k]['step'].dtype ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype and
-            optimizer_state_dict['state'][k]['step'].shape ==
-            optimizer_state_dict['state'][step_state_indexes[0]]['step'].shape
-            for k in step_state_indexes
+    # Preserve checkpoint dictionary order: optimizer state restoration and
+    # subsequent allocation order must not change just to pipeline transfers.
+    entries = [(idx, key, shape, dtype)
+               for idx, fields in sent[0].items()
+               for key, (shape, dtype) in fields.items() if key != 'step']
+    step_indices = [idx for idx, fields in sent[0].items() if 'step' in fields]
+    step_values = {}
+    device = torch.device('cuda', torch.cuda.current_device())
+    if step_indices:
+        shape, dtype = sent[0][step_indices[0]]['step']
+        if any(sent[0][idx]['step'] != (shape, dtype) for idx in step_indices):
+            raise ValueError('Optimizer step tensors must have matching shapes and dtypes')
+        stacked = (torch.stack([optimizer_state_dict['state'][idx]['step'].to(device)
+                                for idx in step_indices]) if rank == src_rank else None)
+        step_stack, = broadcast_checkpoint_tensors(
+            [stacked] if stacked is not None else None,
+            [(tuple([len(step_indices), *shape]), dtype)],
+            src=src_rank, group=curr_parallel_group, device=device,
         )
-        if rank == src_rank:
-            step_stack = torch.stack(
-                [optimizer_state_dict['state'][k]['step'] for k in step_state_indexes]
-            )
-        else:
-            step_stack = torch.zeros(
-                len(step_state_indexes),
-                dtype=optimizer_state_dict['state'][step_state_indexes[0]]['step'].dtype,
-                device=torch.cuda.current_device()
-            )
-        torch.distributed.broadcast(step_stack, src=src_rank, group=curr_parallel_group)
-        if rank != src_rank:
-            for k, v in zip(step_state_indexes, step_stack):
-                optimizer_state_dict['state'][k]['step'].copy_(v)
-
-    # broadcast other states
-    # TODO: can be slow?
-    for k in state_indexes:
-        keys = sorted(optimizer_state_dict['state'][k].keys())
-        # for mixed precision f16 optimizer, we will add custom keys
-        # assert set(keys) == {'step', 'exp_avg', 'exp_avg_sq'}
-        if 'step' in keys:
-            keys.remove('step')  # we have done step in previous.
-        for key in keys:
-            value = optimizer_state_dict['state'][k][key]
-            torch.distributed.broadcast(value.data, src=src_rank, group=curr_parallel_group)
+        step_values = {idx: value.clone() for idx, value in zip(step_indices, step_stack)}
+    values = ([optimizer_state_dict['state'][idx][key] for idx, key, _, _ in entries]
+              if rank == src_rank else None)
+    restored = broadcast_checkpoint_tensors(
+        values, [(shape, dtype) for _, _, shape, dtype in entries],
+        src=src_rank, group=curr_parallel_group,
+        device=device,
+    )
+    values_by_key = {(idx, key): value for (idx, key, _, _), value in zip(entries, restored)}
+    for idx, fields in sent[0].items():
+        optimizer_state_dict['state'][idx] = {
+            key: step_values[idx] if key == 'step' else values_by_key[idx, key]
+            for key in fields
+        }
 
     # Partial-ownership modules (first-stage ViT) are absent on other PP ranks.
     # Only the ranks participating in this broadcast must synchronize here.

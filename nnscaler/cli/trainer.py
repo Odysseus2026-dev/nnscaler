@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 import nnscaler
 from nnscaler.runtime.device import DeviceGroup
-from nnscaler.utils import broadcast_mixed_data, is_running_distributed
+from nnscaler.utils import broadcast_mixed_data, is_running_distributed, run_on_rank0
 
 from .trainer_args import AggregatedOutputs, TrainerArgs, fix_input
 from .train_hook import AggregatedTrainHook, TrainHook, TrainHookHost
@@ -160,6 +160,13 @@ class Trainer:
         # Only non-persistent buffers will be loaded from the small npbuffer.pt file.
         is_resuming = self.train_args.checkpoint.get_resume_checkpoint() is not None
         init_params = not is_resuming
+        # Trainer owns a CUDA model (see self.model.cuda() below). On resume,
+        # allocate generated tensors there directly; the checkpoint fills them.
+        init_device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if is_resuming and not compile_only
+            else None
+        )
 
         pmodel = parallelize_model(
             self.train_args, self.dummy_input,
@@ -167,6 +174,7 @@ class Trainer:
             build_buckets=not self.train_args.should_delay_bucket_building(),
             checkpointer=self.checkpointer,
             init_params=init_params,
+            init_device=init_device,
         )
         if compile_only:
             return
@@ -485,7 +493,12 @@ class Trainer:
 
             state_dict = _broadcast_before_trimmed_broadcast(state_dict, False)
         else:
-            ckpt_files = self.checkpointer.list_checkpoints(resume_from)
+            # Metadata is shared; each rank still reads its own state and
+            # performs the existing topology/completeness checks below. Send
+            # only filenames so node-local mount prefixes remain supported.
+            filenames = run_on_rank0(
+                lambda: [path.name for path in self.checkpointer.list_checkpoints(resume_from)])
+            ckpt_files = [resume_from / name for name in filenames]
             rank_ckpt_files = {int(f.stem): f for f in ckpt_files if f.stem.isdigit()}
             if set(rank_ckpt_files.keys()) != set(range(len(rank_ckpt_files))):
                 raise ValueError(f"Checkpoint files in {resume_from} are not complete: {rank_ckpt_files.keys()}")

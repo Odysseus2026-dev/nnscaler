@@ -13,6 +13,8 @@ import warnings
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 
 import torch
@@ -39,6 +41,90 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+_merged_load_visits = ContextVar('nnscaler_merged_load_visits', default=None)
+
+
+def _can_reuse_merged_load(module):
+    # Custom loaders and hooks may change destination weights without changing
+    # checkpoint tensors (including through .data, which bypasses versions).
+    # Keep the original two-pass behavior unless all handlers are known.
+    for child in module.modules():
+        if getattr(child.load_state_dict, '__func__', None) is not torch.nn.Module.load_state_dict:
+            return False
+        if getattr(child._load_from_state_dict, '__func__', None) not in (
+                torch.nn.Module._load_from_state_dict, ParallelModule._load_from_state_dict):
+            return False
+        if (isinstance(child, ParallelModule)
+                and getattr(child.load_merged_state_dict, '__func__', None)
+                is not ParallelModule.load_merged_state_dict):
+            # A custom loader may do more than check missing keys under strict=True.
+            return False
+        if child._load_state_dict_post_hooks:
+            return False
+        for wrapped_hook in child._load_state_dict_pre_hooks.values():
+            hook = getattr(wrapped_hook, 'hook', wrapped_hook)
+            if getattr(hook, '__func__', hook) is not ParallelModule._pre_load_state_dict_hook:
+                return False
+    return True
+
+
+@contextmanager
+def merged_load_session(module=None):
+    """Deduplicate successful module loads within one restore invocation.
+
+    Nested restores get independent records. Never retain a loaded flag on the
+    module: a subsequent restore must write checkpoint values again.
+    A supplied module with custom loading callbacks keeps the original passes,
+    since callbacks can mutate destination weights independently of the source.
+    """
+    parent = _merged_load_visits.get()
+    visits = {} if module is None or _can_reuse_merged_load(module) else None
+    token = _merged_load_visits.set(visits)
+    try:
+        yield
+    finally:
+        _merged_load_visits.reset(token)
+        if parent is not None:
+            # A nested restore may have changed a module the parent had loaded.
+            parent.clear()
+
+
+def load_merged_module(module, state_dict, prefix='', strict=True):
+    """Share completion records between the recursive and explicit load passes."""
+    visits = _merged_load_visits.get()
+    source = None
+    if visits is not None:
+        # Recursive load_state_dict creates shallow dictionaries. Tensor
+        # identity + mutation version recognize the same values across these
+        # dictionaries without reading tensor contents. Custom transformed
+        # inputs must load again; unversioned/opaque state is not cached.
+        source = {}
+        for key, value in state_dict.items():
+            if not key.startswith(prefix):
+                continue
+            if not isinstance(value, torch.Tensor) or value.is_inference():
+                source = None
+                break
+            source[key] = (value, value._version)
+    previous = visits.get(module) if visits is not None else None
+    if (previous is not None and previous[0] == prefix and source is not None
+            and source.keys() == previous[1].keys()
+            and all(value is previous[1][key][0] and version == previous[1][key][1]
+                    for key, (value, version) in source.items())):
+        missing_keys = list(previous[2])
+        if strict and missing_keys:
+            raise RuntimeError(f'Missing key(s) in state_dict: {missing_keys}.')
+        return missing_keys
+
+    # A different alias can overwrite the same module. Only its most recent
+    # completed prefix can be skipped; the canonical fallback may need to run
+    # again. Failed/partial loads must not leave a completion record either.
+    if visits is not None:
+        visits.pop(module, None)
+    missing_keys = module.load_merged_state_dict(state_dict, prefix, strict=strict)
+    if visits is not None and source is not None:
+        visits[module] = (prefix, source, tuple(missing_keys))
+    return missing_keys
 
 
 @dataclass
@@ -1791,7 +1877,7 @@ class ParallelModule(CubeModule):
         else:
             for hook in self._load_state_dict_pre_hooks.values():
                 hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-            new_missing_keys = self.load_merged_state_dict(state_dict, prefix, strict=False)
+            new_missing_keys = load_merged_module(self, state_dict, prefix, strict=False)
             if strict:
                 missing_keys.extend(new_missing_keys)
 
