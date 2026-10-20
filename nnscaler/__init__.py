@@ -61,7 +61,9 @@ def uninit():
     """
     Uninitialize the nnscaler library.
 
-    It will destroy the torch distributed nccl process_group
+    It releases NNScaler's subgroups in a consistent order, then destroys the
+    default process group if NNScaler initialized it. Call this before destroying
+    an externally initialized default group.
 
     Returns:
         None

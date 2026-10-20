@@ -32,7 +32,7 @@ class _DeviceGroup:
                 if torch.__version__ >= (2, 3):
                     torch.distributed.init_process_group(
                         backend='nccl', timeout=_LARGE_TIMEOUT,
-                        device_id=int(os.environ.get('LOCAL_RANK')),
+                        device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK'))),
                     )
                 else:
                     torch.distributed.init_process_group(
@@ -58,6 +58,7 @@ class _DeviceGroup:
 
         torch.cuda.set_device(self.local_rank)
         self.groups: Dict = { '1'*self.world_size: None }
+        self._owned_groups: List = []
         self.p2p_groups: Dict[tuple[int, int], Optional[torch.distributed.ProcessGroup]] = {}
         self.use_p2p_groups = (
             not CompileFlag.dev_mode
@@ -69,9 +70,23 @@ class _DeviceGroup:
         self.events: Dict[str, torch.cuda.Event] = {}
 
     def close(self):
-        if self._is_pg_initer:
-            torch.distributed.destroy_process_group()
-            self._is_pg_initer = False
+        if torch.distributed.is_initialized():
+            # PyTorch sorts all groups by name on WORLD destruction. Split
+            # names can differ across ranks, so release owned groups in the
+            # common declaration order before destroying the parent.
+            for group in reversed(self._owned_groups):
+                torch.distributed.destroy_process_group(group)
+            if self._is_pg_initer:
+                torch.distributed.destroy_process_group()
+        self._owned_groups.clear()
+        self._is_pg_initer = False
+
+    def _register_group(self, cache, key, group):
+        """Cache every lookup result; own only this rank's live subgroup handles."""
+        assert key not in cache
+        cache[key] = group
+        if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            self._owned_groups.append(group)
 
     def group_exists(self, ranks):
         """
@@ -90,15 +105,46 @@ class _DeviceGroup:
             return None
         rank_bits = self.bitmap(ranks)
         if rank_bits not in self.groups:
-            self.groups[rank_bits] = torch.distributed.new_group(
+            group = torch.distributed.new_group(
                 list(ranks), timeout=_LARGE_TIMEOUT)
+            self._register_group(self.groups, rank_bits, group)
         return self.groups[rank_bits]
+
+    def init_groups(self, groups):
+        """Compatibility entry point for generated group declarations."""
+        self.get_groups(groups)
+
+    def get_groups(self, groups):
+        """Collectively create a group list, batching disjoint memberships.
+
+        Every rank must call this with the same groups, even nonmembers. Cached
+        groups are reused; results preserve input order, including duplicates.
+        WORLD returns None; nonmembers return NON_GROUP_MEMBER.
+        """
+        from nnscaler.runtime.group_init import create_groups
+
+        pending = set()
+        keys = []
+        for ranks in groups:
+            ranks = tuple(sorted(ranks))
+            if not ranks or len(set(ranks)) != len(ranks):
+                raise ValueError('Communication group ranks must be nonempty and unique')
+            if any(not isinstance(rank, int) or rank < 0 or rank >= self.world_size for rank in ranks):
+                raise ValueError(f'Communication group rank outside world size {self.world_size}')
+            key = self.bitmap(ranks)
+            keys.append(key)
+            if key not in self.groups:
+                pending.add(ranks)
+        created = create_groups(sorted(pending), timeout=_LARGE_TIMEOUT)
+        for ranks, group in created.items():
+            self._register_group(self.groups, self.bitmap(ranks), group)
+        return [self.groups[key] for key in keys]
 
     def init_p2p_groups(self, pairs):
         """
         Create deterministic two-rank groups for P2P communication.
 
-        torch.distributed.new_group must be called by all ranks in the same order.
+        All ranks must call this method in the same order.
         The generated module passes a global sorted list of actual P2P pairs.
         """
         if not self.use_p2p_groups:
@@ -113,11 +159,26 @@ class _DeviceGroup:
             normalized_pairs.append((src, dst) if src < dst else (dst, src))
         normalized_pairs = sorted(set(normalized_pairs))
 
-        for pair in normalized_pairs:
-            if pair not in self.p2p_groups:
-                self.p2p_groups[pair] = torch.distributed.new_group(
-                    list(pair), timeout=_LARGE_TIMEOUT)
+        from nnscaler.runtime.group_init import create_groups
+        created = create_groups(
+            [pair for pair in normalized_pairs if pair not in self.p2p_groups],
+            timeout=_LARGE_TIMEOUT,
+        )
+        for pair, group in created.items():
+            self._register_group(self.p2p_groups, pair, group)
         torch.distributed.barrier()
+
+    def get_sync_group(self, stride: int, world_size: int):
+        """Return this rank's strided replica group, reusing existing handles.
+
+        All WORLD ranks must participate when creating a new layout.
+        """
+        if not 0 < stride <= world_size <= self.world_size or world_size % stride:
+            raise ValueError('Sync group size must be a positive multiple of its stride within the world')
+        rank_lists = [list(range(i, world_size, stride)) for i in range(stride)]
+        groups = self.get_groups(rank_lists)
+        index = self.rank % stride
+        return rank_lists[index], groups[index]
 
     def get_p2p_group(self, src: int, dst: int):
         """
@@ -180,16 +241,17 @@ class _DeviceGroup:
         grid = np.arange(cnt).reshape(tuple(group_num))
         dims = list(range(len(group_num)))
         outputs = []
+        groups = []
         for dim, num in enumerate(group_num):
             remain = np.prod(np.delete(group_num, dim))
             order = tuple(dims[:dim] + dims[dim+1:] + [dim])
             grid_dim = np.transpose(grid, order).reshape((remain,num))
             grid_dim = grid_dim.tolist()
+            groups.extend(grid_dim)
             for ranks in grid_dim:
-                # initialize group
-                _ = self.get_group(ranks)
                 if self.rank in ranks:
                     outputs.append(ranks)
+        self.get_groups(groups)
         assert len(outputs) == len(group_num)
         return outputs
 
