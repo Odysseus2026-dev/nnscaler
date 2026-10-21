@@ -14,6 +14,20 @@ from nnscaler.runtime.device import _DeviceGroup
 TIMEOUT = timedelta(seconds=30)
 
 
+@pytest.mark.parametrize('ranks,expected', [
+    ((0,), 506952122),
+    ((0, 1), 1301594146),
+    ((1348, 1380), 1301438770),
+    ((1355, 1387), 1301438770),
+    (tuple(range(48)), 1140696785),
+    (tuple(range(1584)), 279511113),
+])
+def test_split_color_matches_pytorch_native_hash(ranks, expected):
+    # Reference values from genNcclSplitColor in PyTorch's NCCLUtils.cpp.
+    # Long memberships exercise size_t overflow and the signed int64 cast.
+    assert group_init._nccl_split_color(ranks) == expected
+
+
 def test_partition_groups_are_disjoint_complete_and_order_independent():
     groups = [(0, 1), (2, 3), (0, 2), (1, 3), (0,), (1,), (2,), (3,)]
     batches = group_init.partition_groups(groups)
@@ -23,6 +37,14 @@ def test_partition_groups_are_disjoint_complete_and_order_independent():
     for batch in batches:
         ranks = [rank for group in batch for rank in group]
         assert len(ranks) == len(set(ranks))
+
+
+def test_colliding_nccl_colors_are_created_in_separate_rounds():
+    # These disjoint pairs collide in PyTorch's native genNcclSplitColor.
+    # In one split round they become a four-rank NCCL communicator, while
+    # PyTorch still assumes each group has two ranks.
+    pairs = [(1348, 1380), (1355, 1387)]
+    assert group_init.partition_groups(pairs) == [[pairs[0]], [pairs[1]]]
 
 
 def test_production_layout_batches():
@@ -36,7 +58,12 @@ def test_production_layout_batches():
     pairs = [(base + lane + a * stage, base + lane + b * stage)
              for base in range(0, world, scale) for lane in range(stage)
              for a, b in [(0, 1), (0, 2), (1, 2)]]
-    assert len(group_init.partition_groups(pairs)) == 3
+    batches = group_init.partition_groups(pairs)
+    assert len(batches) == 3
+    for batch in batches:
+        assert not {(1348, 1380), (1355, 1387)}.issubset(batch)
+        colors = [group_init._nccl_split_color(ranks) for ranks in batch]
+        assert len(set(colors)) == len(colors)
 
 
 def fake_backend(monkeypatch, rank):
@@ -57,6 +84,16 @@ def fake_backend(monkeypatch, rank):
     monkeypatch.setattr(dist, 'split_group', split, raising=False)
     monkeypatch.setattr(dist, 'new_group', ordinary)
     return calls
+
+
+@pytest.mark.parametrize('rank', [0, 1348, 1355, 1380, 1387])
+def test_color_collision_preserves_group_membership(monkeypatch, rank):
+    calls = fake_backend(monkeypatch, rank)
+    pairs = [(1348, 1380), (1355, 1387)]
+    result = group_init.create_groups(pairs, timeout=TIMEOUT)
+    assert calls == [('ordinary', list(pair)) for pair in pairs]
+    for pair in pairs:
+        assert result[pair] == (pair if rank in pair else dist.GroupMember.NON_GROUP_MEMBER)
 
 
 @pytest.mark.parametrize('rank', range(6))

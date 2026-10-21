@@ -53,6 +53,16 @@ def _batched_group_worker(directory):
                                 init_method=f'file://{Path(directory) / str(generation)}',
                                 device_id=torch.device('cuda', rank), timeout=timedelta(seconds=60))
         manager = DeviceGroup()
+        from nnscaler.runtime.group_init import _nccl_split_color, _split_context
+        split_context = _split_context()
+        if generation == 0 and split_context is not None and split_context[1]:
+            # Verify the Python collision guard against this PyTorch build's
+            # native split color, rather than its different Python hash.
+            members = list(range(world // 2)) if rank < world // 2 else list(range(world // 2, world))
+            native_group = dist.split_group(split_ranks=[list(range(world // 2)), list(range(world // 2, world))])
+            native_backend = native_group._get_backend(torch.device('cuda', rank))
+            assert native_backend.options.split_color == _nccl_split_color(members)
+            dist.destroy_process_group(native_group)
         groups = [[0, 1], [2, 3], [0, 2]] if world == 4 else [[0], [1]]
         registry_before = len(dist.distributed_c10d._world.pg_names)
         manager.init_groups(groups)

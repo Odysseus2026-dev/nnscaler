@@ -1,26 +1,44 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Create communication groups in deterministic, non-overlapping rounds."""
+"""Create communication groups in deterministic, collision-free split rounds."""
+import ctypes
 import hashlib
 
 import torch
 import torch.distributed as dist
 
 
+def _nccl_split_color(ranks):
+    """Match PyTorch's native genNcclSplitColor, including size_t overflow.
+
+    split_group uses this C++ hash, not distributed_c10d._process_group_color.
+    Distinct disjoint memberships can hash to the same NCCL split color.
+    """
+    combined_hash = 0
+    for rank in ranks:
+        combined_hash = ctypes.c_size_t(
+            combined_hash ^ (rank + 0x9e3779b9 + (combined_hash << 6) + (combined_hash >> 2))
+        ).value
+    return abs(ctypes.c_int64(combined_hash).value) % ((1 << 31) - 1)
+
+
 def partition_groups(groups):
-    """Pack memberships into rounds without putting a rank in two groups."""
-    batches, occupied = [], []
+    """Pack memberships without reusing a rank or NCCL color in one round."""
+    batches, occupied, colors = [], [], []
     for ranks in sorted(set(groups), key=lambda ranks: (-len(ranks), ranks)):
         members = set(ranks)
-        for batch, used in zip(batches, occupied):
-            if members.isdisjoint(used):
+        color = _nccl_split_color(ranks)
+        for batch, used, used_colors in zip(batches, occupied, colors):
+            if members.isdisjoint(used) and color not in used_colors:
                 batch.append(ranks)
                 used.update(members)
+                used_colors.add(color)
                 break
         else:
             batches.append([ranks])
             occupied.append(members)
+            colors.append({color})
     return batches
 
 
